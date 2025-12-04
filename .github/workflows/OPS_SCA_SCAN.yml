@@ -1,0 +1,187 @@
+name: OPS_SCA_SCAN
+run-name: SCA Scan using GitHub Actions
+ 
+on:
+  workflow_dispatch:
+    inputs:
+      branch:
+        description: 'Name of the branch'
+        required: true
+        default: 'test'
+ 
+      diff:
+        description: 'Make the artifact from commit to commit (ex: true or false )'
+        default: 'false'
+ 
+      overall:
+        description: 'Make the artifact based on the branch (ex: true or false )'
+        default: 'false'
+ 
+      fromCommit:
+        description: 'From which commit to start to make the artifacts'
+        required: false
+        default: ''
+ 
+      toCommit:
+        description: 'To which commit to make the artifact'
+        required: false
+        default: ''
+ 
+      OrgUrl:
+        description: 'Domain url of the salesforce org'
+        #required: true
+        default: 'https://login.salesforce.com'
+ 
+      OrgToken:
+        description: 'Access token for the salesforce org'
+       # required: true
+ 
+      stepId:
+        description: 'stepId'
+        required: false
+ 
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check the variables and set
+        id: setvars
+        run: |
+          echo "Branch: ${{ github.event.inputs.branch }}"
+          echo "Diff: ${{ github.event.inputs.diff }}"
+          echo "Overall: ${{ github.event.inputs.overall }}"
+          echo "From commit: ${{ github.event.inputs.fromCommit }}"
+          echo "To commit: ${{ github.event.inputs.toCommit }}"
+          echo "Domain URL: ${{ github.event.inputs.OrgUrl }}"
+          echo "Access Token: ${{ github.event.inputs.OrgToken }}"
+          if [[ "${{ github.event.inputs.diff }}" == "true" && "${{ github.event.inputs.overall }}" == "true" ]]; then
+            echo "Both diff and overall cannot be true at the same time"
+            exit 1
+          fi
+ 
+      - name: Install Salesforce CLI
+        run: npm install --global @salesforce/cli
+ 
+      - name: Install Salesforce Scanner Plugin
+        run: sf plugins install @salesforce/sfdx-scanner
+ 
+      - name: Checkout repo
+        uses: actions/checkout@v3
+        with:
+          ref: ${{ github.event.inputs.branch }}
+          fetch-depth: 0
+ 
+      #  DIFF SCAN 
+      - name: Run Diff Scan
+        if: ${{ github.event.inputs.diff == 'true' }}
+        shell: bash
+        run: |
+          set -o pipefail
+          mkdir -p reports
+          # Detect new and modified files (A = added, M = modified)
+          NEW_FILES=$(git diff --name-status "${{ github.event.inputs.fromCommit }}" "${{ github.event.inputs.toCommit }}" \
+            | awk '/^A/ {print $2}' | grep -E '\.(cls|js)$' || true)
+          MODIFIED_FILES=$(git diff --name-status "${{ github.event.inputs.fromCommit }}" "${{ github.event.inputs.toCommit }}" \
+            | awk '/^M/ {print $2}' | grep -E '\.(cls|js)$' || true)
+          echo "New files:"
+          echo "$NEW_FILES"
+          echo "Modified files:"
+          echo "$MODIFIED_FILES"
+          # ---------- FULL SCAN (all violations on changed files) ----------
+          if [ -n "$NEW_FILES$MODIFIED_FILES" ]; then
+            sf scanner:run --format json --target $NEW_FILES $MODIFIED_FILES \
+              --outfile reports/diff_full.json || echo "[]" > reports/diff_full.json
+          else
+            echo "[]" > reports/diff_full.json
+          fi
+          # ---------- DELTA SCAN ----------
+          #  New files → take violations as-is
+          if [ -n "$NEW_FILES" ]; then
+            sf scanner:run --format json --target $NEW_FILES > new.json 2>/dev/null || echo "[]" > new.json
+          else
+            echo "[]" > new.json
+          fi
+          #  Modified files → only violations on *added* lines
+          if [ -n "$MODIFIED_FILES" ]; then
+            sf scanner:run --format json --target $MODIFIED_FILES > modified.json 2>/dev/null || echo "[]" > modified.json
+            # Build per-file map of added line numbers
+            echo "[]" > line_map.json
+            for f in $MODIFIED_FILES; do
+              mapfile -t LINES < <(git diff -U0 "${{ github.event.inputs.fromCommit }}" "${{ github.event.inputs.toCommit }}" -- "$f" \
+                | grep '^@@' \
+                | sed -E 's/.*\+([0-9]+)(,([0-9]+))?.*/\1 \3/' \
+                | awk '{ start=$1; count=($2==""?1:$2); for (i=0;i<count;i++) print start+i }')
+              if [ ${#LINES[@]} -gt 0 ]; then
+                JSON_LINES=$(printf "%s\n" "${LINES[@]}" | jq -R -s 'split("\n") | map(select(length>0))')
+                jq --arg file "$f" --argjson lines "$JSON_LINES" '. + [{fileName:$file, lines:$lines}]' line_map.json > _tmp.json && mv _tmp.json line_map.json
+              fi
+            done
+            # Filter modified violations to only those on added lines, per file
+            jq --slurpfile m line_map.json '
+              def lines_for(fname):
+                ($m[0][] | select(.fileName==fname) | .lines) // [];
+              map(select(.violations != null)) |
+              map({
+                engine: "pmd", 
+                fileName: .fileName,
+                violations: [ .violations[] | select((.line|tostring) as $l | any(lines_for(.fileName)[]; . == $l)) ]
+              }) | map(select(.violations|length>0))
+            ' modified.json > modified_delta.json
+          else
+            echo "[]" > modified_delta.json
+          fi 
+          # Combine new-file violations + modified-file delta violations
+          jq -s 'add' new.json modified_delta.json > reports/diff_delta.json
+          echo "Created reports:"
+          ls -l reports
+          
+ 
+      # OVERALL SCAN
+      - name: Run Overall Scan
+        if: ${{ github.event.inputs.overall == 'true' }}
+        run: |
+          echo "Running SCA on entire branch..."
+          mkdir -p reports
+          sf scanner:run \
+            --format json \
+            --target "force-app/**/*.cls,force-app/**/*.js" \
+            --outfile reports/overall.json || true
+ 
+      # UPLOAD ARTIFACTS
+      - name: Upload SCA Reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: sca-reports
+          path: reports/*.json
+ 
+      # SEND TO SALESFORCE
+      - name: Upload Reports to Salesforce
+        if: always()
+        run: |
+          if [[ "${{ github.event.inputs.diff }}" == "true" ]]; then
+            echo "Preparing combined diff reports payload..."
+            jq -n \
+              --arg stepId "${{ github.event.inputs.stepId }}" \
+              --slurpfile diff_full reports/diff_full.json \
+              --slurpfile diff_delta reports/diff_delta.json \
+              '{
+                stepId: $stepId,
+                reports: {
+                  diff_full: $diff_full[0],
+                  diff_delta: $diff_delta[0]
+                }
+              }' > payload.json
+            echo "Sending combined diff_full + diff_delta in one request..."
+            SCANRESP=$(curl -s -w "%{http_code}" -o response.json \
+              -X POST "${{ github.event.inputs.OrgUrl }}/services/apexrest/scanresponse" \
+              -H "Authorization: Bearer ${{ github.event.inputs.OrgToken }}" \
+              -H "Content-Type: application/json" \
+              --data-binary @payload.json)
+            if [[ "$SCANRESP" != "200" && "$SCANRESP" != "201" ]]; then
+              echo "Upload failed (status $SCANRESP)"
+              cat response.json
+            else
+              echo "Uploaded combined diff reports successfully."
+            fi
+          fi 
