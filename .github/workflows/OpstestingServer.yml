@@ -1,0 +1,110 @@
+name: OpstestingServer
+run-name: SFDX Lean with GitHub Actions
+
+on:
+  workflow_dispatch:
+    inputs:
+      OrgName:
+        description: 'The name of the Salesforce organization'
+        required: true
+      WorkItemTask:
+        description: 'The work item task Id to pass Workflow Run Id'
+        required: true
+      OrgUsername:
+        description: 'The username of the Salesforce organization'
+        required: true
+      OrgToken:
+        description: 'The token for the Salesforce organization'
+        required: true
+      OrgUrl:
+        description: 'The URL for the Salesforce organization'
+        required: true
+      fromCommit:
+        description: 'Commit Id from revision'
+        required: true
+      toCommit:
+        description: 'Commit Id to revision'
+        required: true
+      Work_Item_Task:
+        description: 'Work Item Task that invoked this action'
+        required: true
+      Gov_Access_Token:
+        description: 'Governance Org Access Token'
+        required: true
+      Gov_Domain_Url:
+        description: 'Governance Org Domain Url'
+        required: true
+
+jobs:
+  Build_Deploy:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Set up JDK 18
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'adopt'
+          java-version: '18'
+          architecture: 'x64'
+
+      - name: Set up Node.js 21
+        uses: actions/setup-node@v4
+        with:
+          node-version: '21'
+
+      - name: Install Salesforce CLI using Node 21
+        run: npm install -g @salesforce/cli
+
+      - name: Install SFDX Delta Package tool
+        run: |
+          wget https://cfsfdx.s3.amazonaws.com/sfdxlean.jar
+          echo "From Commit: ${{ github.event.inputs.fromCommit }}"
+          echo "To Commit: ${{ github.event.inputs.toCommit }}"
+
+      - name: Checkout HEAD
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.toCommit }}
+          path: ${{ github.workspace }}/head
+          fetch-depth: 5
+
+      - name: Checkout HEAD^
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.fromCommit }}
+          path: ${{ github.workspace }}/head~1
+
+      - name: Create Delta Package
+        run: |
+          java -cp sfdxlean.jar com.cf.services.PackageCreation \
+            -c=${{ github.workspace }}/head \
+            -s=${{ github.event.inputs.fromCommit }} \
+            -e=${{ github.event.inputs.toCommit }} \
+            -f=${{ github.workspace }}/head~1 \
+            -a=force-app \
+            -x=package
+ 
+      - name: Install Code Analyzer plugin
+        run: sf plugins install code-analyzer
+
+      - name: Run Salesforce Code Analyzer
+        run: |
+          mkdir -p ${{ github.workspace }}/dist
+          cd ${{ github.workspace }}/dist/changed-metadata
+          sf code-analyzer run -t "./**/*" -f "${{ github.workspace }}/dist/ScanResults.csv"
+
+      - name: Deploy Delta Package
+        run: |
+          java -cp sfdxlean.jar com.cf.services.RunDeployment \
+            -m=${{ github.workspace }}/dist \
+            -h=${{ github.event.inputs.OrgUrl }} \
+            -u=${{ github.event.inputs.OrgUrl }} \
+            -a=${{ github.event.inputs.OrgToken }} \
+            -t="NoTestRun" \
+            -v=false
+ 
+      - name: Archive Deployment Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ github.run_number }}
+          path: ${{ github.workspace }}/dist
