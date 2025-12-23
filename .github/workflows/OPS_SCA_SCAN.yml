@@ -29,12 +29,10 @@ on:
  
       OrgUrl:
         description: 'Domain url of the salesforce org'
-        #required: true
         default: 'https://login.salesforce.com'
  
       OrgToken:
         description: 'Access token for the salesforce org'
-       # required: true
  
       stepId:
         description: 'stepId'
@@ -76,62 +74,233 @@ jobs:
         if: ${{ github.event.inputs.diff == 'true' }}
         shell: bash
         run: |
-          set -o pipefail
+          set +e  # Don't exit on error, we want to handle errors ourselves
           mkdir -p reports
+          
+          # Initialize error log as empty
+          echo "[]" > reports/error_log.json
+          
+          # Variable to track if SCA execution had errors
+          SCA_FAILED=false
+          
           # Detect new and modified files (A = added, M = modified)
           NEW_FILES=$(git diff --name-status "${{ github.event.inputs.fromCommit }}" "${{ github.event.inputs.toCommit }}" \
             | awk '/^A/ {print $2}' | grep -E '\.(cls|js)$' || true)
           MODIFIED_FILES=$(git diff --name-status "${{ github.event.inputs.fromCommit }}" "${{ github.event.inputs.toCommit }}" \
             | awk '/^M/ {print $2}' | grep -E '\.(cls|js)$' || true)
+          
           echo "New files:"
           echo "$NEW_FILES"
           echo "Modified files:"
           echo "$MODIFIED_FILES"
+          
           # ---------- FULL SCAN (all violations on changed files) ----------
           if [ -n "$NEW_FILES$MODIFIED_FILES" ]; then
+            echo "Running full scan on all changed files..."
+            # Capture both stdout and stderr, but keep them separate
             sf scanner:run --format json --target $NEW_FILES $MODIFIED_FILES \
-              --outfile reports/diff_full.json || echo "[]" > reports/diff_full.json
+              --outfile reports/diff_full_temp.json > sca_full_stdout.txt 2> sca_full_stderr.txt
+            
+            SCAN_EXIT_CODE=$?
+            
+            # Check stderr for parse failures (PMD warnings about files it couldn't parse)
+            if grep -q "PMD failed to evaluate against file" sca_full_stderr.txt 2>/dev/null; then
+              echo "SCA Full Scan - PMD failed to parse one or more files"
+              SCA_FAILED=true
+              
+              # Capture ALL output
+              STDOUT_CONTENT=$(cat sca_full_stdout.txt 2>/dev/null || echo "")
+              STDERR_CONTENT=$(cat sca_full_stderr.txt 2>/dev/null || echo "")
+              
+              # Combine all error information
+              FULL_ERROR_OUTPUT="${STDERR_CONTENT}${STDOUT_CONTENT}"
+              
+              # Escape for JSON 
+              ESCAPED_ERROR=$(printf '%s' "$FULL_ERROR_OUTPUT" | jq -Rs .)
+              
+              # Create error log as array with single string
+              echo "[$ESCAPED_ERROR]" > reports/error_log.json
+              
+              # Clear diff_full - NO VIOLATIONS when there's an error
+              echo "[]" > reports/diff_full.json
+              
+              # Remove temp file
+              rm -f reports/diff_full_temp.json
+            # Check if the JSON output file is valid
+            elif [ ! -f reports/diff_full_temp.json ] || ! jq empty reports/diff_full_temp.json 2>/dev/null; then
+              echo "SCA Full Scan produced invalid JSON - likely due to syntax errors in files"
+              SCA_FAILED=true
+              
+              # Capture ALL output: stdout (console output) + stderr (warnings/errors)
+              STDOUT_CONTENT=$(cat sca_full_stdout.txt 2>/dev/null || echo "")
+              STDERR_CONTENT=$(cat sca_full_stderr.txt 2>/dev/null || echo "")
+              
+              # Try to get jq error too
+              JQ_ERROR=$(jq empty reports/diff_full_temp.json 2>&1 || echo "")
+              
+              # Combine all error information
+              FULL_ERROR_OUTPUT="${STDERR_CONTENT}${STDOUT_CONTENT}${JQ_ERROR}"
+              
+              # Escape for JSON 
+              ESCAPED_ERROR=$(printf '%s' "$FULL_ERROR_OUTPUT" | jq -Rs .)
+              
+              # Create error log as array with single string
+              echo "[$ESCAPED_ERROR]" > reports/error_log.json
+              
+              # Clear diff_full - NO VIOLATIONS when there's an error
+              echo "[]" > reports/diff_full.json
+              
+              # Remove temp file
+              rm -f reports/diff_full_temp.json
+            elif [ $SCAN_EXIT_CODE -ne 0 ]; then
+              echo "SCA Full Scan command failed with exit code $SCAN_EXIT_CODE"
+              SCA_FAILED=true
+              
+              STDOUT_CONTENT=$(cat sca_full_stdout.txt 2>/dev/null || echo "")
+              STDERR_CONTENT=$(cat sca_full_stderr.txt 2>/dev/null || echo "")
+              ERROR_OUTPUT="${STDERR_CONTENT}${STDOUT_CONTENT}"
+              
+              ESCAPED_ERROR=$(printf '%s' "$ERROR_OUTPUT" | jq -Rs .)
+              echo "[$ESCAPED_ERROR]" > reports/error_log.json
+              
+              # Clear diff_full - NO VIOLATIONS when there's an error
+              echo "[]" > reports/diff_full.json
+              
+              # Remove temp file
+              rm -f reports/diff_full_temp.json
+            else
+              # Success - move temp file to final location
+              mv reports/diff_full_temp.json reports/diff_full.json
+            fi
           else
             echo "[]" > reports/diff_full.json
           fi
+          
           # ---------- DELTA SCAN ----------
-          #  New files → take violations as-is
-          if [ -n "$NEW_FILES" ]; then
-            sf scanner:run --format json --target $NEW_FILES > new.json 2>/dev/null || echo "[]" > new.json
-          else
-            echo "[]" > new.json
-          fi
-          #  Modified files → only violations on *added* lines
-          if [ -n "$MODIFIED_FILES" ]; then
-            sf scanner:run --format json --target $MODIFIED_FILES > modified.json 2>/dev/null || echo "[]" > modified.json
-            # Build per-file map of added line numbers
-            echo "[]" > line_map.json
-            for f in $MODIFIED_FILES; do
-              mapfile -t LINES < <(git diff -U0 "${{ github.event.inputs.fromCommit }}" "${{ github.event.inputs.toCommit }}" -- "$f" \
-                | grep '^@@' \
-                | sed -E 's/.*\+([0-9]+)(,([0-9]+))?.*/\1 \3/' \
-                | awk '{ start=$1; count=($2==""?1:$2); for (i=0;i<count;i++) print start+i }')
-              if [ ${#LINES[@]} -gt 0 ]; then
-                JSON_LINES=$(printf "%s\n" "${LINES[@]}" | jq -R -s 'split("\n") | map(select(length>0))')
-                jq --arg file "$f" --argjson lines "$JSON_LINES" '. + [{fileName:$file, lines:$lines}]' line_map.json > _tmp.json && mv _tmp.json line_map.json
+          # Only run delta scan if full scan succeeded
+          if [ "$SCA_FAILED" = false ]; then
+            #  New files → take violations as-is
+            if [ -n "$NEW_FILES" ]; then
+              echo "Running scan on new files..."
+              sf scanner:run --format json --target $NEW_FILES > new.json 2> sca_new_stderr.txt
+              
+              NEW_EXIT_CODE=$?
+              
+              # Check stderr for parse failures
+              if grep -q "PMD failed to evaluate against file" sca_new_stderr.txt 2>/dev/null; then
+                echo "SCA scan on new files - PMD failed to parse one or more files"
+                SCA_FAILED=true
+                
+                STDERR_CONTENT=$(cat sca_new_stderr.txt 2>/dev/null || echo "")
+                ESCAPED_ERROR=$(printf '%s' "$STDERR_CONTENT" | jq -Rs .)
+                echo "[$ESCAPED_ERROR]" > reports/error_log.json
+                echo "[]" > new.json
+                echo "[]" > reports/diff_delta.json
+                # Clear diff_full since we had an error
+                echo "[]" > reports/diff_full.json
+              elif ! jq empty new.json 2>/dev/null; then
+                echo "SCA scan on new files produced invalid JSON"
+                SCA_FAILED=true
+                
+                STDERR_CONTENT=$(cat sca_new_stderr.txt 2>/dev/null || echo "")
+                STDOUT_CONTENT=$(cat new.json 2>/dev/null || echo "")
+                NEW_ERROR_OUTPUT="${STDERR_CONTENT}\n${STDOUT_CONTENT}"
+                
+                ESCAPED_ERROR=$(echo "$NEW_ERROR_OUTPUT" | sed 's/"/\\"/g' | sed 's/$/\\n/' | tr -d '\n')
+                echo "[\"$ESCAPED_ERROR\"]" > reports/error_log.json
+                echo "[]" > new.json
+                echo "[]" > reports/diff_delta.json
+                # Clear diff_full since we had an error
+                echo "[]" > reports/diff_full.json
+              elif [ $NEW_EXIT_CODE -ne 0 ]; then
+                echo "SCA scan on new files failed with exit code $NEW_EXIT_CODE"
+                SCA_FAILED=true
+                
+                ERROR_OUTPUT=$(cat sca_new_stderr.txt)
+                ESCAPED_ERROR=$(echo "$ERROR_OUTPUT" | sed 's/"/\\"/g' | sed 's/$/\\n/' | tr -d '\n')
+                echo "[\"$ESCAPED_ERROR\"]" > reports/error_log.json
+                echo "[]" > new.json
+                echo "[]" > reports/diff_delta.json
+                # Clear diff_full since we had an error
+                echo "[]" > reports/diff_full.json
               fi
-            done
-            # Filter modified violations to only those on added lines, per file
-            jq --slurpfile m line_map.json '
-              def lines_for(fname):
-                ($m[0][] | select(.fileName==fname) | .lines) // [];
-              map(select(.violations != null)) |
-              map({
-                engine: "pmd", 
-                fileName: .fileName,
-                violations: [ .violations[] | select((.line|tostring) as $l | any(lines_for(.fileName)[]; . == $l)) ]
-              }) | map(select(.violations|length>0))
-            ' modified.json > modified_delta.json
+            else
+              echo "[]" > new.json
+            fi
+            
+            #  Modified files → only violations on *added* lines
+            if [ -n "$MODIFIED_FILES" ] && [ "$SCA_FAILED" = false ]; then
+              echo "Running scan on modified files..."
+              sf scanner:run --format json --target $MODIFIED_FILES > modified.json 2> sca_modified_stderr.txt
+              
+              MODIFIED_EXIT_CODE=$?
+              
+              if ! jq empty modified.json 2>/dev/null; then
+                echo "SCA scan on modified files produced invalid JSON"
+                SCA_FAILED=true
+                
+                STDERR_CONTENT=$(cat sca_modified_stderr.txt 2>/dev/null || echo "")
+                INVALID_JSON=$(cat modified.json 2>/dev/null || echo "")
+                JQ_ERROR=$(jq empty modified.json 2>&1 || echo "")
+                MODIFIED_ERROR_OUTPUT="${STDERR_CONTENT}${JQ_ERROR}"
+                
+                ESCAPED_ERROR=$(printf '%s' "$MODIFIED_ERROR_OUTPUT" | jq -Rs .)
+                echo "[$ESCAPED_ERROR]" > reports/error_log.json
+                echo "[]" > modified.json
+                echo "[]" > modified_delta.json
+                echo "[]" > reports/diff_delta.json
+              elif [ $MODIFIED_EXIT_CODE -ne 0 ]; then
+                echo "SCA scan on modified files failed with exit code $MODIFIED_EXIT_CODE"
+                SCA_FAILED=true
+                
+                ERROR_OUTPUT=$(cat sca_modified_stderr.txt 2>/dev/null || echo "")
+                ESCAPED_ERROR=$(printf '%s' "$ERROR_OUTPUT" | jq -Rs .)
+                echo "[$ESCAPED_ERROR]" > reports/error_log.json
+                echo "[]" > modified.json
+                echo "[]" > modified_delta.json
+                echo "[]" > reports/diff_delta.json
+              else
+                # Build per-file map of added line numbers
+                echo "[]" > line_map.json
+                for f in $MODIFIED_FILES; do
+                  mapfile -t LINES < <(git diff -U0 "${{ github.event.inputs.fromCommit }}" "${{ github.event.inputs.toCommit }}" -- "$f" \
+                    | grep '^@@' \
+                    | sed -E 's/.*\+([0-9]+)(,([0-9]+))?.*/\1 \3/' \
+                    | awk '{ start=$1; count=($2==""?1:$2); for (i=0;i<count;i++) print start+i }')
+                  if [ ${#LINES[@]} -gt 0 ]; then
+                    JSON_LINES=$(printf "%s\n" "${LINES[@]}" | jq -R -s 'split("\n") | map(select(length>0))')
+                    jq --arg file "$f" --argjson lines "$JSON_LINES" '. + [{fileName:$file, lines:$lines}]' line_map.json > _tmp.json && mv _tmp.json line_map.json
+                  fi
+                done
+                
+                # Filter modified violations to only those on added lines, per file
+                jq --slurpfile m line_map.json '
+                  def lines_for(fname):
+                    ($m[0][] | select(.fileName==fname) | .lines) // [];
+                  map(select(.violations != null)) |
+                  map({
+                    engine: "pmd", 
+                    fileName: .fileName,
+                    violations: [ .violations[] | select((.line|tostring) as $l | any(lines_for(.fileName)[]; . == $l)) ]
+                  }) | map(select(.violations|length>0))
+                ' modified.json > modified_delta.json
+              fi
+            else
+              echo "[]" > modified_delta.json
+            fi 
+            
+            # Combine new-file violations + modified-file delta violations (only if no failures)
+            if [ "$SCA_FAILED" = false ]; then
+              jq -s 'add' new.json modified_delta.json > reports/diff_delta.json
+            else
+              echo "[]" > reports/diff_delta.json
+            fi
           else
-            echo "[]" > modified_delta.json
-          fi 
-          # Combine new-file violations + modified-file delta violations
-          jq -s 'add' new.json modified_delta.json > reports/diff_delta.json
+            # If full scan failed, set delta to empty
+            echo "[]" > reports/diff_delta.json
+          fi
+          
+          echo "SCA scan execution status: SCA_FAILED=$SCA_FAILED"
           echo "Created reports:"
           ls -l reports
           
@@ -140,12 +309,42 @@ jobs:
       - name: Run Overall Scan
         if: ${{ github.event.inputs.overall == 'true' }}
         run: |
+          set +e
           echo "Running SCA on entire branch..."
           mkdir -p reports
+          
+          # Initialize error log as empty
+          echo "[]" > reports/error_log.json
+          
           sf scanner:run \
             --format json \
             --target "force-app/**/*.cls,force-app/**/*.js" \
-            --outfile reports/overall.json || true
+            --outfile reports/overall.json > sca_overall_stdout.txt 2> sca_overall_stderr.txt
+          
+          SCAN_EXIT_CODE=$?
+          
+          if ! jq empty reports/overall.json 2>/dev/null; then
+            echo "SCA Overall Scan produced invalid JSON"
+            
+            STDOUT_CONTENT=$(cat sca_overall_stdout.txt 2>/dev/null || echo "")
+            STDERR_CONTENT=$(cat sca_overall_stderr.txt 2>/dev/null || echo "")
+            JQ_ERROR=$(jq empty reports/overall.json 2>&1 || echo "")
+            OVERALL_ERROR_OUTPUT="${STDERR_CONTENT}${STDOUT_CONTENT}${JQ_ERROR}"
+            
+            ESCAPED_ERROR=$(printf '%s' "$OVERALL_ERROR_OUTPUT" | jq -Rs .)
+            echo "[$ESCAPED_ERROR]" > reports/error_log.json
+            echo "[]" > reports/overall.json
+          elif [ $SCAN_EXIT_CODE -ne 0 ]; then
+            echo "SCA Overall Scan failed with exit code $SCAN_EXIT_CODE"
+            
+            STDOUT_CONTENT=$(cat sca_overall_stdout.txt 2>/dev/null || echo "")
+            STDERR_CONTENT=$(cat sca_overall_stderr.txt 2>/dev/null || echo "")
+            ERROR_OUTPUT="${STDERR_CONTENT}${STDOUT_CONTENT}"
+            
+            ESCAPED_ERROR=$(printf '%s' "$ERROR_OUTPUT" | jq -Rs .)
+            echo "[$ESCAPED_ERROR]" > reports/error_log.json
+            echo "[]" > reports/overall.json
+          fi
  
       # UPLOAD ARTIFACTS
       - name: Upload SCA Reports
@@ -160,28 +359,80 @@ jobs:
         if: always()
         run: |
           if [[ "${{ github.event.inputs.diff }}" == "true" ]]; then
-            echo "Preparing combined diff reports payload..."
+            echo "Preparing combined diff reports payload with error log..."
+             # Ensure all required files exist
+            [ ! -f reports/diff_full.json ] && echo "[]" > reports/diff_full.json
+            [ ! -f reports/diff_delta.json ] && echo "[]" > reports/diff_delta.json
+            [ ! -f reports/error_log.json ] && echo "[]" > reports/error_log.json
+            
+         
+            
+            # Read error log
+            ERROR_LOG_CONTENT=$(cat reports/error_log.json)
+            
             jq -n \
               --arg stepId "${{ github.event.inputs.stepId }}" \
               --slurpfile diff_full reports/diff_full.json \
               --slurpfile diff_delta reports/diff_delta.json \
+              --argjson error_log "$ERROR_LOG_CONTENT" \
               '{
                 stepId: $stepId,
                 reports: {
                   diff_full: $diff_full[0],
-                  diff_delta: $diff_delta[0]
+                  diff_delta: $diff_delta[0],
+                  error_log: $error_log
                 }
               }' > payload.json
-            echo "Sending combined diff_full + diff_delta in one request..."
+            
+           
+            
+            echo "Sending combined diff_full + diff_delta + error_log in one request..."
             SCANRESP=$(curl -s -w "%{http_code}" -o response.json \
               -X POST "${{ github.event.inputs.OrgUrl }}/services/apexrest/scanresponse" \
               -H "Authorization: Bearer ${{ github.event.inputs.OrgToken }}" \
               -H "Content-Type: application/json" \
               --data-binary @payload.json)
+            
             if [[ "$SCANRESP" != "200" && "$SCANRESP" != "201" ]]; then
               echo "Upload failed (status $SCANRESP)"
               cat response.json
             else
               echo "Uploaded combined diff reports successfully."
             fi
-          fi 
+          fi
+          
+          if [[ "${{ github.event.inputs.overall }}" == "true" ]]; then
+            echo "Preparing overall report payload with error log..."
+             # Ensure all required files exist
+            [ ! -f reports/overall.json ] && echo "[]" > reports/overall.json
+            [ ! -f reports/error_log.json ] && echo "[]" > reports/error_log.json
+            
+            # Read error log
+            ERROR_LOG_CONTENT=$(cat reports/error_log.json)
+            
+            jq -n \
+              --arg stepId "${{ github.event.inputs.stepId }}" \
+              --slurpfile overall reports/overall.json \
+              --argjson error_log "$ERROR_LOG_CONTENT" \
+              '{
+                stepId: $stepId,
+                reports: {
+                  overall: $overall[0],
+                  error_log: $error_log
+                }
+              }' > payload.json
+            
+            echo "Sending overall report + error_log..."
+            SCANRESP=$(curl -s -w "%{http_code}" -o response.json \
+              -X POST "${{ github.event.inputs.OrgUrl }}/services/apexrest/scanresponse" \
+              -H "Authorization: Bearer ${{ github.event.inputs.OrgToken }}" \
+              -H "Content-Type: application/json" \
+              --data-binary @payload.json)
+            
+            if [[ "$SCANRESP" != "200" && "$SCANRESP" != "201" ]]; then
+              echo "Upload failed (status $SCANRESP)"
+              cat response.json
+            else
+              echo "Uploaded overall report successfully."
+            fi
+          fi
