@@ -2,6 +2,7 @@
 <Queue xmlns="http://soap.sforce.com/2006/04/metadata">
     <doesSendEmailToMembers>false</doesSendEmailToMembers>
     <name>record type_1</name>
+    <!--Vimala-->
     <queueMembers>
         <users>
             <user>auser@s.s</user>
