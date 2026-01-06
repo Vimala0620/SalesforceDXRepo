@@ -3,6 +3,9 @@
     <types>
         <members>Class331</members>
         <name>ApexClass</name>
+        <members>NewObject2_Ops__c</members>
+        <members>NewObject1_ops__c</members>
+        <name>CustomObject</name>
     </types>
     <version>64.0</version>
 </Package>
