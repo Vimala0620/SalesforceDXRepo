@@ -2,7 +2,7 @@
 <Skill xmlns="http://soap.sforce.com/2006/04/metadata">
     <assignments>
         <profiles>
-            <profile>analytics cloud integration user</profile>
+            <profile>Analytics Cloud Integration User</profile>
         </profiles>
     </assignments>
     <label>Ops bridge1</label>
