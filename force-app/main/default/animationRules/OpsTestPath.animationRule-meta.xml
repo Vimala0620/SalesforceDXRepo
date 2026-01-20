@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<AnimationRule xmlns="http://soap.sforce.com/2006/04/metadata">
+    <animationFrequency>rarely</animationFrequency>
+    <developerName>OpsTestPath</developerName>
+    <isActive>true</isActive>
+    <masterLabel>OpsTestPath</masterLabel>
+    <recordTypeContext>Custom</recordTypeContext>
+    <recordTypeName>Test2RT</recordTypeName>
+    <sobjectType>Opportunity</sobjectType>
+    <targetField>DeliveryInstallationStatus__c</targetField>
+    <targetFieldChangeToValues>In progress,Yet to begin,Completed</targetFieldChangeToValues>
+</AnimationRule>
