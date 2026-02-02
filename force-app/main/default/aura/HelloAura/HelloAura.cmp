@@ -1,0 +1,7 @@
+<aura:component>
+    <lightning:card title="Aura Component Example">
+        <p class="slds-p-around_medium">
+            Hello, this is my first Aura component!
+        </p>
+    </lightning:card>
+</aura:component>
