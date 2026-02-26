@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<PathAssistant xmlns="http://soap.sforce.com/2006/04/metadata">
+    <active>true</active>
+    <entityName>Case</entityName>
+    <fieldName>PotentialLiability__c</fieldName>
+    <masterLabel>Path4Ops</masterLabel>
+    <pathAssistantSteps>
+        <fieldNames>AssetId</fieldNames>
+        <fieldNames>BusinessHoursId</fieldNames>
+        <fieldNames>CaseNumber</fieldNames>
+        <fieldNames>CurrencyIsoCode</fieldNames>
+        <picklistValueName>No</picklistValueName>
+    </pathAssistantSteps>
+    <pathAssistantSteps>
+        <fieldNames>AccountId</fieldNames>
+        <fieldNames>Origin</fieldNames>
+        <picklistValueName>Yes</picklistValueName>
+    </pathAssistantSteps>
+    <recordTypeName>__MASTER__</recordTypeName>
+</PathAssistant>

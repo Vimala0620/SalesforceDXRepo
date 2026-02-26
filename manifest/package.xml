@@ -3,6 +3,16 @@
     <types>
         <members>HyderabadSalesPortal1</members>
         <name>SiteDotCom</name>
+        <members>Path4Ops</members>
+        <name>PathAssistant</name>
+    </types>
+    <types>
+        <members>Case</members>
+        <name>EscalationRules</name>
+    </types>
+    <types>
+        <members>Custome_MetaData.OpsData</members>
+        <name>CustomMetadata</name>
     </types>
     <version>64.0</version>
 </Package>

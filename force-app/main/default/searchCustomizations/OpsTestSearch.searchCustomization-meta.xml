@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<SearchCustomization xmlns="http://soap.sforce.com/2006/04/metadata">
+    <channel>CustomChannel</channel>
+    <masterLabel>OpsTestSearch</masterLabel>
+    <objectOverride>
+        <explicitFilter>
+            <fieldPath>Opportunity.Account.Name</fieldPath>
+            <type>field</type>
+        </explicitFilter>
+        <objectApiName>Quote</objectApiName>
+    </objectOverride>
+    <selectedObject>Quote</selectedObject>
+</SearchCustomization>
