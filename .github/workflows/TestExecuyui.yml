@@ -1,0 +1,275 @@
+name: OPS_PMD_SCAN
+run-name: PMD Scan using GitHub Actions
+ 
+on:
+  workflow_dispatch:
+    inputs:
+      name:
+        description: 'Run name or label'
+        required: true
+      branch:
+        description: 'Branch name to analyze (e.g., main, develop)'
+        required: true
+        default: 'main'
+      fromCommitId:
+        description: 'From commit '
+        required: false
+        default: '90bf5443ad8baab21a6837eca38cdad06c686a77'
+      toCommitId:
+        description: 'To commit '
+        required: false
+        default: '03d3536c6cb8944ec97053a08e1bf7af3af5d531'
+      overall:
+        description: 'Run PMD on whole branch (true) or only changed files (false)'
+        required: true
+        default: 'false'
+      orgUrl:
+        description: 'Salesforce Instance URL (e.g., https://yourInstance.my.salesforce.com)'
+        required: true
+      orgToken:
+        description: 'Salesforce Access Token'
+        required: true
+      stepId:
+        description: 'StepId for the PMD analysis'
+        required: true
+        default: 'a3TRT000000VIoi2AG'
+ 
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v3
+        with:
+          ref: ${{ github.event.inputs.branch }}
+ 
+      - name: Setup Java (required for PMD)
+        uses: actions/setup-java@v3
+        with:
+          distribution: 'temurin'
+          java-version: '17'
+ 
+      - name: Install PMD
+        run: |
+          curl -L -o pmd-bin.zip https://github.com/pmd/pmd/releases/download/pmd_releases%2F6.55.0/pmd-bin-6.55.0.zip
+          unzip -q pmd-bin.zip
+ 
+      - name: Cache PMD Incremental Analysis
+        uses: actions/cache@v3
+        with:
+          path: .pmdCache
+          key: pmd-${{ github.event.inputs.branch }}
+          restore-keys: |
+            pmd-
+ 
+      - name: Determine Target Files and Run PMD
+        id: changes
+        shell: bash
+        run: |
+          echo "Run Label: ${{ github.event.inputs.name }}"
+          echo "Branch: ${{ github.event.inputs.branch }}"
+          echo "Overall: ${{ github.event.inputs.overall }}"
+          echo "FromCommitId: ${{ github.event.inputs.fromCommitId }}"
+          echo "ToCommitId: ${{ github.event.inputs.toCommitId }}"
+          echo "SFInstanceUrl: ${{ github.event.inputs.orgUrl }}"
+ 
+          mkdir -p reports
+ 
+          if [ "${{ github.event.inputs.overall }}" = "true" ]; then
+            echo "Running PMD on entire branch..."
+            TARGET_FILES=$(find force-app -type f -name "*.cls")
+            echo "Target files:"
+            echo "$TARGET_FILES"
+ 
+            if [ -n "$TARGET_FILES" ]; then
+              ./pmd-bin-6.55.0/bin/run.sh pmd \
+                -cache .pmdCache \
+                -d $TARGET_FILES \
+                -R pmd-apex-rules.xml \
+                -f json \
+                -r reports/pmd-report.json || true
+              echo "---- pmd-report.json ----"
+              cat reports/pmd-report.json | jq '.'
+            else
+              echo "[]" > reports/pmd-report.json
+            fi
+          else
+            if [ -z "${{ github.event.inputs.fromCommitId }}" ] || [ -z "${{ github.event.inputs.toCommitId }}" ]; then
+              echo "Error: fromCommitId and toCommitId must be provided when overall = false"
+              exit 1
+            fi
+ 
+            echo "Running PMD on changed files between commits..."
+            git fetch origin ${{ github.event.inputs.branch }} --depth=100
+ 
+            NEW_FILES=$(git diff --name-status "${{ github.event.inputs.fromCommitId }}" "${{ github.event.inputs.toCommitId }}" \
+              | awk '/^A/ {print $2}' | grep -E '\.(cls|js)$' || true)
+ 
+            MODIFIED_FILES=$(git diff --name-status "${{ github.event.inputs.fromCommitId }}" "${{ github.event.inputs.toCommitId }}" \
+              | awk '/^M/ {print $2}' | grep -E '\.(cls|js)$' || true)
+ 
+            echo "New files:"
+            echo "$NEW_FILES"
+            echo "Modified files:"
+            echo "$MODIFIED_FILES"
+ 
+            if [ -n "$NEW_FILES$MODIFIED_FILES" ]; then
+              echo "Running full NEW + MODIFIED scan..."
+              FILES="$NEW_FILES $MODIFIED_FILES"
+              ./pmd-bin-6.55.0/bin/run.sh pmd \
+                -cache .pmdCache \
+                -d $FILES \
+                -R pmd-apex-rules.xml \
+                -f json \
+                -r reports/diff_full.json || true
+              echo "---- diff_full.json ----"
+              cat reports/diff_full.json | jq '.'
+            else
+              echo "[]" > reports/diff_full.json
+            fi
+ 
+            if [ -n "$NEW_FILES" ]; then
+              echo "Running delta NEW scan..."
+              ./pmd-bin-6.55.0/bin/run.sh pmd \
+                -cache .pmdCache \
+                -d $NEW_FILES \
+                -R pmd-apex-rules.xml \
+                -f json \
+                -r reports/new.json || true
+              echo "---- new.json ----"
+              cat reports/new.json | jq '.'
+            else
+              echo "[]" > reports/new.json
+            fi
+ 
+            if [ -n "$MODIFIED_FILES" ]; then
+              echo "Running delta MODIFIED scan..."
+              ./pmd-bin-6.55.0/bin/run.sh pmd \
+                -cache .pmdCache \
+                -d $MODIFIED_FILES \
+                -R pmd-apex-rules.xml \
+                -f json \
+                -r reports/modified.json || true
+              echo "---- modified.json ----"
+              cat reports/modified.json | jq '.'
+ 
+              echo "[]" > reports/line_map.json
+              for f in $MODIFIED_FILES; do
+                mapfile -t LINES < <(git diff -U0 "${{ github.event.inputs.fromCommitId }}" "${{ github.event.inputs.toCommitId }}" -- "$f" \
+                  | grep '^@@' \
+                  | sed -E 's/.*\+([0-9]+)(,([0-9]+))?.*/\1 \3/' \
+                  | awk '{ start=$1; count=($2==""?1:$2); for (i=0;i<count;i++) print start+i }')
+                if [ ${#LINES[@]} -gt 0 ]; then
+                  JSON_LINES=$(printf "%s\n" "${LINES[@]}" | jq -R -s 'split("\n") | map(select(length>0))')
+                  jq --arg file "$f" --argjson lines "$JSON_LINES" '. + [{fileName:$file, lines:$lines}]' reports/line_map.json > _tmp.json && mv _tmp.json reports/line_map.json
+                fi
+              done
+              echo "---- line_map.json ----"
+              cat reports/line_map.json | jq '.'
+ 
+              CHANGED_LINES=$(cat reports/line_map.json | jq -r '.[0].lines[]')
+              echo "Changed lines: $CHANGED_LINES"
+ 
+              cat reports/modified.json | jq --argjson changed_lines "$(echo "$CHANGED_LINES" | jq -R -s 'split("\n") | map(select(length>0)) | map(tonumber)')" '
+                {
+                  formatVersion: .formatVersion,
+                  pmdVersion: .pmdVersion,
+                  timestamp: (now | todate),
+                  files: [
+                    .files[] | {
+                      filename: .filename,
+                      violations: [
+                        .violations[] |
+                        select(
+                          .beginline as $bl | .endline as $el |
+                          $changed_lines | any(. >= $bl and . <= $el)
+                        )
+                      ]
+                    } | select(.violations | length > 0)
+                  ],
+                  suppressedViolations: (.suppressedViolations // []),
+                  processingErrors: (.processingErrors // []),
+                  configurationErrors: (.configurationErrors // [])
+                }
+              ' > reports/modified_delta.json
+ 
+              echo "---- modified_delta.json ----"
+              cat reports/modified_delta.json | jq '.'
+            else
+              echo "[]" > reports/modified_delta.json
+            fi
+ 
+            NEW_JSON=$(jq 'if type=="array" then {files: .} else . end' reports/new.json)
+            MODIFIED_JSON=$(jq 'if type=="array" then {files: .} else . end' reports/modified_delta.json)
+ 
+            jq -n --argjson new "$NEW_JSON" --argjson mod "$MODIFIED_JSON" \
+            '{files: ($new.files + $mod.files)}' > reports/diff_delta.json
+ 
+            echo "---- diff_delta.json ----"
+            cat reports/diff_delta.json | jq '.'
+ 
+          fi
+ 
+          echo "Files to scan:"
+          echo "$NEW_FILES $MODIFIED_FILES"
+ 
+          {
+            echo "files<<EOF"
+            echo "$NEW_FILES $MODIFIED_FILES"
+            echo "EOF"
+          } >> $GITHUB_OUTPUT
+ 
+      - name: Upload PMD Report + Recent Changes to Salesforce
+        if: steps.changes.outputs.files != ''
+        run: |
+          echo "Merging PMD results into payload.json..."
+ 
+          if [ "${{ github.event.inputs.overall }}" = "true" ]; then
+            [ -f reports/pmd-report.json ] || echo "[]" > reports/pmd-report.json
+            jq -n \
+              --arg stepId "${{ github.event.inputs.stepId }}" \
+              --slurpfile report reports/pmd-report.json \
+              '{stepId: $stepId, reports: $report[0]}' > payload.json
+          else
+            [ -f reports/diff_delta.json ] || echo "[]" > reports/diff_delta.json
+            [ -f reports/diff_full.json ] || echo "[]" > reports/diff_full.json
+            jq -n \
+              --arg stepId "${{ github.event.inputs.stepId }}" \
+              --slurpfile delta reports/diff_delta.json \
+              --slurpfile full reports/diff_full.json \
+              '{stepId: $stepId,reports:{ diff_delta: $delta[0], diff_full: $full[0]}}' > payload.json
+          fi
+ 
+          echo "---- payload.json ----"
+          cat payload.json | jq '.'
+ 
+          echo "Uploading combined payload to Salesforce..."
+          SCANRESP=$(curl -s -w "%{http_code}" -o response.json \
+            -X POST "${{ github.event.inputs.orgUrl }}/services/apexrest/scanresponse" \
+            -H "Authorization: Bearer ${{ github.event.inputs.orgToken }}" \
+            -H "Content-Type: application/json" \
+            --data-binary @payload.json)
+ 
+          if [[ "$SCANRESP" != "200" && "$SCANRESP" != "201" ]]; then
+            echo "scanresponse failed with status: $SCANRESP"
+            ERROR_MSG=$(cat response.json | jq -r '.[0].message? // "Unknown error"')
+            jq -n \
+              --arg stepId "${{ github.event.inputs.stepId }}" \
+              --arg errorMessage "$ERROR_MSG" \
+              '{stepId: $stepId, errorMessage: $errorMessage}' > error_payload.json
+            echo "---- error_payload.json ----"
+            cat error_payload.json | jq '.'
+            curl -s -X POST "${{ github.event.inputs.orgUrl }}/services/apexrest/errorresponse" \
+              -H "Authorization: Bearer ${{ github.event.inputs.orgToken }}" \
+              -H "Content-Type: application/json" \
+              --data-binary @error_payload.json || true
+          else
+            echo "scanresponse uploaded successfully."
+          fi
+ 
+      - name: Upload JSON Reports as Artifact
+        if: steps.changes.outputs.files != ''
+        uses: actions/upload-artifact@v4
+        with:
+          name: reports-json
+          path: reports/*.json

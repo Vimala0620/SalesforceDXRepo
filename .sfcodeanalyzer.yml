@@ -1,0 +1,13 @@
+engines:
+  pmd:
+    java_command: "C:\Program Files\Microsoft\jdk-17.0.14.7-hotspot\bin\java.exe
+C:\Program Files\ojdkbuild\java-11-openjdk-jre-11.0.15-1\bin\java.exe"
+    disable_engine: false
+  cpd:
+    java_command: "C:\Program Files\Microsoft\jdk-17.0.14.7-hotspot\bin\java.exe
+C:\Program Files\ojdkbuild\java-11-openjdk-jre-11.0.15-1\bin\java.exe"
+    disable_engine: false
+  sfge:
+    java_command: "C:\Program Files\Microsoft\jdk-17.0.14.7-hotspot\bin\java.exe
+C:\Program Files\ojdkbuild\java-11-openjdk-jre-11.0.15-1\bin\java.exe"
+    disable_engine: false
